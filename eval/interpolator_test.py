@@ -29,74 +29,106 @@ from typing import Sequence
 from . import interpolator as interpolator_lib
 from . import util
 from absl import app
-from absl import flags
 import numpy as np
+from datetime import datetime
+import resource
+import functools
+import natsort
+import tensorflow as tf
+import gc
+from multiprocessing import Process
+
+
+gpus = tf.config.list_physical_devices('GPU')
+if gpus:
+  # Restrict TensorFlow to only allocate 1GB of memory on the first GPU
+  try:
+    tf.config.set_logical_device_configuration(
+        gpus[0],
+        [tf.config.LogicalDeviceConfiguration(memory_limit=1024)])
+    logical_gpus = tf.config.list_logical_devices('GPU')
+    print(len(gpus), "Physical GPUs,", len(logical_gpus), "Logical GPUs")
+  except RuntimeError as e:
+    # Virtual devices must be set before GPUs have been initialized
+    print(e)
+
 
 # Controls TF_CCP log level.
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '1'
 
+def process(start_frame_path, end_frame_path):
+  print(str(datetime.now()) + ": Processing with start frame %s and end frame %s" % (start_frame_path, end_frame_path))
+  
+  # Start the model
+  print(str(datetime.now()) + ": Starting interpolator...")
+  interpolator = interpolator_lib.Interpolator(
+      model_path="pretrained_models/film_net/Style/saved_model",
+      align=64,
+      block_shape=[1, 1])
+  print(str(datetime.now()) + ": Started")
 
-_FRAME1 = flags.DEFINE_string(
-    name='frame1',
-    default=None,
-    help='The filepath of the first input frame.',
-    required=True)
-_FRAME2 = flags.DEFINE_string(
-    name='frame2',
-    default=None,
-    help='The filepath of the second input frame.',
-    required=True)
-_MODEL_PATH = flags.DEFINE_string(
-    name='model_path',
-    default=None,
-    help='The path of the TF2 saved model to use.')
-_OUTPUT_FRAME = flags.DEFINE_string(
-    name='output_frame',
-    default=None,
-    help='The output filepath of the interpolated mid-frame.')
-_ALIGN = flags.DEFINE_integer(
-    name='align',
-    default=64,
-    help='If >1, pad the input size so it is evenly divisible by this value.')
-_BLOCK_HEIGHT = flags.DEFINE_integer(
-    name='block_height',
-    default=1,
-    help='An int >= 1, number of patches along height, '
-    'patch_height = height//block_height, should be evenly divisible.')
-_BLOCK_WIDTH = flags.DEFINE_integer(
-    name='block_width',
-    default=1,
-    help='An int >= 1, number of patches along width, '
-    'patch_width = width//block_width, should be evenly divisible.')
+  # Read our new start frame
+  print(str(datetime.now()) + ": Reading start frame at " + start_frame_path + "...")
+  start_frame = util.read_image(start_frame_path)
+  start_frame_batch = np.expand_dims(start_frame, axis=0)
+  print(str(datetime.now()) + ": Done")
 
+  # Read our new end frame
+  print(str(datetime.now()) + ": Reading end frame at " + end_frame_path + "...")
+  end_frame = util.read_image(end_frame_path)
+  end_frame_batch = np.expand_dims(end_frame, axis=0)
+  print(str(datetime.now()) + ": Done")
+
+  # Batched time.
+  print(str(datetime.now()) + ": Batched time(?)...")
+  batch_dt = np.full(shape=(1,), fill_value=0.5, dtype=np.float32)
+  print(str(datetime.now()) + ": Done")
+
+  # Invoke the model for one mid-frame interpolation.
+  print(str(datetime.now()) + ": Invoke the model to get a mid point...")
+  mid_frame = interpolator(start_frame_batch, end_frame_batch, batch_dt)[0]
+  mid_frame_batch = np.expand_dims(mid_frame, axis=0)
+  print(str(datetime.now()) + ": Done")
+
+  # Invoke the model for one quarter-frame interpolation between the start and mid frame
+  print(str(datetime.now()) + ": Invoke the model to get a quarter point...")
+  quarter_frame = interpolator(start_frame_batch, mid_frame_batch, batch_dt)[0]
+  print(str(datetime.now()) + ": Done")
+
+  # Invoke the model for one three-quarter-frame interpolation between the mid and end frame
+  print(str(datetime.now()) + ": Invoke the model to get a three-quarter point...")
+  three_quarter_frame = interpolator(mid_frame_batch, end_frame_batch, batch_dt)[0]
+  print(str(datetime.now()) + ": Done")
+
+  # Write interpolated mid-frame.
+  print(str(datetime.now()) + ": Write the files...")
+  start_frame_image_name = os.path.basename(start_frame_path).split(".")[0]
+  quarter_frame_path = f'xangle/{start_frame_image_name}.25.png'
+  util.write_image(quarter_frame_path, quarter_frame)
+  mid_frame_path = f'xangle/{start_frame_image_name}.50.png'
+  util.write_image(mid_frame_path, mid_frame)
+  three_quarter_frame_path = f'xangle/{start_frame_image_name}.75.png'
+  util.write_image(three_quarter_frame_path, three_quarter_frame)
+  print(str(datetime.now()) + ": Done " + start_frame_image_name)
 
 def _run_interpolator() -> None:
   """Writes interpolated mid frame from a given two input frame filepaths."""
 
-  interpolator = interpolator_lib.Interpolator(
-      model_path=_MODEL_PATH.value,
-      align=_ALIGN.value,
-      block_shape=[_BLOCK_HEIGHT.value, _BLOCK_WIDTH.value])
+  # Get the list of images
+  print(str(datetime.now()) + ": Getting image files...")
+  input_frames_list = natsort.natsorted(tf.io.gfile.glob(f'xangle/*.jpg'))
+  print(str(datetime.now()) + "Got images: " + str(input_frames_list))
 
-  # First batched image.
-  image_1 = util.read_image(_FRAME1.value)
-  image_batch_1 = np.expand_dims(image_1, axis=0)
+  # Loop through each pair of frames to generate a mid-point image from each
+  for index_start in range(0, len(input_frames_list) - 1):
+    start_frame_path = input_frames_list[index_start];
+    end_frame_path = input_frames_list[index_start + 1];
+    
+    p = Process(target=process, args=(start_frame_path, end_frame_path,))
+    p.start()
+    p.join()
 
-  # Second batched image.
-  image_2 = util.read_image(_FRAME2.value)
-  image_batch_2 = np.expand_dims(image_2, axis=0)
-
-  # Batched time.
-  batch_dt = np.full(shape=(1,), fill_value=0.5, dtype=np.float32)
-
-  # Invoke the model for one mid-frame interpolation.
-  mid_frame = interpolator(image_batch_1, image_batch_2, batch_dt)[0]
-
-  # Write interpolated mid-frame.
-  mid_frame_filepath = _OUTPUT_FRAME.value
-  if not mid_frame_filepath:
-    mid_frame_filepath = f'{os.path.dirname(_FRAME1.value)}/output_frame.png'
-  util.write_image(mid_frame_filepath, mid_frame)
+  print("Max RAM " + str(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss))
 
 
 def main(argv: Sequence[str]) -> None:
